@@ -1,0 +1,291 @@
+---
+title: "Time Series Forecasting"
+author: "Reza Abazari"
+date: "2025-11-17"
+output: html_document
+---
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(dynlm)
+library(forecast)
+library(vars)
+library(caTools)
+library(fpp2)
+library(urca)
+library(caret)
+library(reshape2)
+library(zoo)
+library(this.path)
+```
+
+Script Directory and data
+```{r}
+
+script_dir <- this.dir()
+cat("Script directory:", script_dir, "\n")
+input_final_df <- file.path(script_dir, "final_df.csv")
+input_county_pop <- file.path(script_dir, "County.csv")
+
+output_hierarchical <- file.path(script_dir, "Hierarchical.csv")
+output_univariate <- file.path(script_dir, "Univariate.csv")
+
+```
+
+Load and Preprocess Data
+```{r}
+df <- read.csv(input_final_df)
+
+df$PctBeds <- ifelse(df$PctBeds == 0, 0.001,
+ifelse(df$PctBeds > 1, 0.999, df$PctBeds))
+
+df <- df %>%
+mutate(Hospitalized_Patients =
+PctBeds * (Staffed.All.Beds + Staffed.ICU.Beds))
+
+df$Date <- as.character(df$Date)
+
+df$Date <- gsub("([0-9]{4})([0-9]{2})([0-9]{2})",
+                "\\1-\\2-\\3",
+                df$Date)
+
+df$Date <- as.Date(df$Date, format = "%Y-%m-%d")
+
+logit_transform <- function(x) log(x/(1-x))
+
+df <- df %>%
+dplyr::mutate(logit_Vaccines = logit_transform(Vaccines)) %>%
+dplyr::select(Cases, PctBeds, County, Date, Staffed.All.Beds, Staffed.ICU.Beds,
+Hospitalized_Patients, Testing, Vaccines, Deaths, logit_Vaccines) %>%
+dplyr::mutate(Days = as.numeric(Date - as.Date("2021-01-14")))
+
+```
+
+Load County Population File
+```{r}
+County_pop <- read.csv(input_county_pop)
+df$Population <- County_pop$pop
+
+```
+
+Aggregate to Florida Level
+```{r}
+florida_df <- df %>%
+group_by(Date) %>%
+summarise(
+TotalCases = sum(Cases),
+TotalPop = sum(Population)
+) %>%
+mutate(Day = 1:n(),
+CasesPer100K = TotalCases/TotalPop * 1e5) %>%
+slice(1:130)
+
+```
+
+Whole Florida Forecasting (ARIMA)
+```{r}
+Whole_FL_df <- df %>%
+group_by(Date) %>%
+summarise(
+TotalCases = sum(Cases),
+TotalTesting = sum(Testing),
+TotalHospitalizations = sum(Hospitalized_Patients),
+TotalVaccines = sum(Vaccines)
+)
+
+Whole_FL_df <- Whole_FL_df %>% mutate(across(-Date, as.numeric))
+
+train_FL <- Whole_FL_df[1:40,]
+
+fit0_FL <- auto.arima(train_FL$TotalHospitalizations,
+stepwise = FALSE,
+approximation = FALSE)
+
+```
+
+Rolling Forecast Procedure
+```{r}
+forecast_steps <- 14
+iterations <- 15
+all_fc <- matrix(NA, nrow = 0, ncol = 4)
+
+for(i in 1:iterations){
+
+train_end <- 40 + (i-1)*forecast_steps
+test_start <- train_end + 1
+test_end <- test_start + forecast_steps - 1
+
+train_df <- Whole_FL_df[1:train_end,]
+test_df  <- Whole_FL_df[test_start:test_end,]
+
+fit <- auto.arima(train_df$TotalHospitalizations)
+fc <- forecast(fit, h = forecast_steps)
+
+block <- cbind(fc$mean,
+test_df$TotalHospitalizations,
+fc$upper[,2],
+fc$lower[,2])
+
+all_fc <- rbind(all_fc, block)
+}
+
+forecast_df <- data.frame(
+forecasted = all_fc[,1],
+actual     = all_fc[,2],
+upper      = all_fc[,3],
+lower      = all_fc[,4],
+day        = 41:250
+)
+
+```
+
+
+Plot Florida Hospitalizations vs Cases
+```{r}
+merged <- forecast_df %>%
+left_join(Whole_FL_df %>% mutate(day = row_number()), by="day")
+
+scale_factor <- max(merged$actual) / max(merged$TotalCases)
+
+ggplot(merged, aes(day)) +
+geom_line(aes(y = actual/100000, color="Hospitalizations"), size=1) +
+geom_line(aes(y = TotalCases/100000*scale_factor, color="Cases"), size=1) +
+scale_y_continuous(
+name="Hospitalized per 100,000",
+sec.axis = sec_axis(~ ./scale_factor,
+name="Cases per 100,000")
+) +
+scale_color_manual(values=c("red","blue")) +
+theme_minimal()
+
+```
+
+Regional Analysis (Regions 1–7)
+```{r}
+fit_region <- function(region_name, counties, df){
+
+region_df <- df %>%
+filter(County %in% counties) %>%
+group_by(Date) %>%
+summarise(
+TotalCases = sum(Cases),
+TotalTesting = sum(Testing),
+TotalHospitalizations = sum(Hospitalized_Patients),
+TotalVaccines = sum(Vaccines)
+) %>%
+mutate(across(-Date, as.numeric))
+
+forecast_steps <- 14
+iterations <- 15
+all_fc <- matrix(NA, nrow = 0, ncol = 4)
+
+for(i in 1){
+  train_end <- 40 + (i-1)*forecast_steps
+  test_start <- train_end + 1
+  test_end <- test_start + forecast_steps - 1
+
+  train_df <- region_df[1:train_end,]
+  test_df  <- region_df[test_start:test_end,]
+
+  fit <- auto.arima(train_df$TotalHospitalizations)
+  fc <- forecast(fit, h = forecast_steps)
+
+  block <- cbind(fc$mean,
+               test_df$TotalHospitalizations,
+               fc$upper[,2],
+               fc$lower[,2])
+
+  all_fc <- rbind(all_fc, block)
+
+}
+
+data.frame(
+forecasted = all_fc[,1],
+actual = all_fc[,2],
+upper = all_fc[,3],
+lower = all_fc[,4],
+day = 41:250,
+Region = region_name
+)
+}
+
+```
+
+
+Run All Regions
+```{r}
+regions <- list(
+"Region 1" = c('Escambia','Santa Rosa','Okaloosa','Walton','Holmes','Washington','Bay','Jackson','Calhoun','Gulf'),
+"Region 2" = c('Gadsden','Liberty','Franklin','Leon','Wakulla','Jefferson','Madison','Taylor','Hamilton','Suwannee','Lafayette','Dixie','Columbia'),
+"Region 3" = c('Baker','Union','Bradford','Alachua','Gilchrist','Levy','Nassau','Duval','Clay','St. Johns','Putnam','Marion','Flagler'),
+"Region 4" = c('Citrus','Sumter','Hernando','Pasco','Pinellas','Hillsborough','Polk','Hardee'),
+"Region 5" = c('Lake','Volusia','Seminole','Orange','Osceola','Brevard','Indian River','St. Lucie','Martin'),
+"Region 6" = c('Manatee','Sarasota','DeSoto','Highlands','Okeechobee','Glades','Charlotte','Hendry','Lee','Collier'),
+"Region 7" = c('Palm Beach','Broward','Miami-Dade','Monroe')
+)
+
+regional_forecasts <- bind_rows(
+lapply(names(regions), function(r)
+fit_region(r, regions[[r]], df)
+)
+)
+
+```
+
+
+Compute α = Hospitalizations per Case
+```{r}
+region_cases <- bind_rows(
+  lapply(names(regions), function(r) {
+    df %>%
+      filter(County %in% regions[[r]]) %>%
+      group_by(Date) %>%
+      summarise(TotalCases = sum(Cases)) %>%
+      mutate(day = row_number(),
+             Region = r)
+  })
+)
+
+forecast_df_alpha <- forecast_df %>%
+  mutate(across(
+    c(forecasted, actual, upper, lower),
+    ~ . / Whole_FL_df$TotalCases[day]
+  ))
+
+regional_alpha <- regional_forecasts %>%
+  left_join(region_cases, by = c("day", "Region")) %>%
+  mutate(across(
+    c(forecasted, actual, upper, lower),
+    ~ . / TotalCases
+  ))
+
+
+```
+
+
+Plot α Across Regions
+```{r}
+ggplot() +
+geom_line(data = forecast_df_alpha,
+aes(day, forecasted, color="Florida (Univariate)"), size=1.2) +
+geom_line(data = regional_alpha,
+aes(day, forecasted, color=Region), size=0.8) +
+theme_minimal() +
+labs(x="Day", y="Hospital bed demand per case") +
+theme(legend.title = element_blank(),legend.position="top", text = element_text(size=14))
+
+```
+
+Save Output Files (USING script_dir)
+```{r}
+write.csv(regional_alpha, output_hierarchical, row.names = FALSE)
+write.csv(forecast_df_alpha, output_univariate, row.names = FALSE)
+
+cat("Files saved to:", script_dir, "\n")
+
+```
+
