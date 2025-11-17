@@ -1,0 +1,227 @@
+---
+title: "SIR_Estimation_Florida"
+title: "SIR Parameter Estimation for Florida Counties"
+author: "Seyedreza (reza) Abazari"
+date: "11/14/2025"
+output: html_document
+---
+
+# Overview
+
+This document estimates **SIR model parameters (β, γ, R₀)** for  
+**Florida counties** using NYTimes county-level COVID-19 data.
+
+The computation uses:
+
+- ODE solving via **deSolve**
+- County shapefiles & FIPS codes via **tigris**
+- Census population data
+- NYTimes daily county case data
+
+
+```{r}
+library(stringi)
+library(ggplot2)
+library(deSolve)
+library(tigris)
+library(lattice)
+library(censusapi)
+library(lubridate)
+library(this.path)
+script_dir <- this.dir()
+cat("Script directory:", script_dir, "\n")
+```
+
+
+```{r}
+# functions to compile
+SIR <- function(time, state, parameters) {
+  par <- as.list(c(state, parameters))
+  with(par, {
+    dS = -beta/N*I*S
+    dI = beta/N*I*S - gamma*I
+    dR = gamma*I
+    list(c(dS, dI, dR))
+  })
+}
+
+# simulate SIR for 2 regions that commute to each other
+SIR2Regions <- function(time, state, parameters) {
+  x = as.matrix(state)
+  S = x[1:2]
+  I = x[3:4]
+  R = x[5:6]
+  with(as.list(parameters), {
+
+    F_mat = matrix(0, ncol = 2, nrow = 2)
+    
+    dS = -beta/N*I*S + F_mat %*% S
+    dI = beta/N*I*S - gamma*I + F_mat %*% I
+    dR = gamma*I + F_mat %*% R
+    
+    list(c(dS, dI, dR))
+  })
+}
+
+```
+
+
+```{r}
+fitSIR = function(Infected, N, observedDays, endPoint) {
+  RSS <- function(parameters, Infected, observedDays) {
+    names(parameters) <- c("beta", "gamma")
+    out <- ode(y = init, times = observedDays, func = SIR,
+               parms = parameters, method = 'bdf')
+    fit <- out[, 3]
+    sum((Infected - fit)^2)
+  }
+  
+  if (Infected[1] == 0) { Infected[1] = 1 }  # if first week is 0
+  
+  init <- c(S = N - Infected[1], I = Infected[1], R = 0)
+  param0 = c(.1, 0.2)
+
+  Opt <- optim(
+    param0, RSS, method = "L-BFGS-B",
+    lower = c(0, 0), upper = c(Inf, Inf),
+    control = list(maxit = 20000),
+    Infected = Infected, observedDays = observedDays
+  )
+  
+  Opt_par <- setNames(Opt$par, c("beta", "gamma"))
+  R0 = Opt$par[1] / Opt$par[2]
+
+  fit <- data.frame(
+    ode(y = init, times = seq(1, endPoint),
+        func = SIR, parms = Opt_par, method = 'bdf')
+  )
+
+  return(list(fit = fit, SIRprm = Opt_par, R0 = R0))
+}
+
+```
+
+```{r}
+# use NYTimes county level data
+AllCountyNames = fips_codes$county[fips_codes$state_code=='12']
+AllCountyCodes = fips_codes$county_code[fips_codes$state_code=='12']
+
+Sys.setenv(CENSUS_KEY = "0e95aa62e853f18e1d8099dbbc0ca054cdf14f81")
+readRenviron("~/.Renviron"); Sys.getenv("CENSUS_KEY")
+
+options(tigris_use_cache = TRUE)
+
+fl2010_cnty <- getCensus(
+  name = "dec/sf1",
+  vintage = 2010,
+  vars = c("H010001"),
+  region = "county:*",
+  regionin = "state:12"
+)
+
+fl2010_cnty$name = AllCountyNames[
+  match(fl2010_cnty$county, AllCountyCodes)
+]
+
+dfCovidDailyCounty3 =
+  read.csv(file.path(script_dir,'countyLevelFL_DailyCovid_2020-2021.csv'))
+
+dfCovidDailyCounty3 = dfCovidDailyCounty3[, -1]
+dfCovidDailyCounty3$date = as.Date(dfCovidDailyCounty3$date)
+datevec3 = unique(dfCovidDailyCounty3$date)
+
+```
+
+
+```{r}
+dfCovidDailyCounty4 = data.frame(
+  county = fl2010_cnty$name,
+  pop = fl2010_cnty$H010001,
+  fip = paste('12', fl2010_cnty$county, sep = "")
+)
+
+N = 40  # daily data from 07/22/2020 to 10/19/2020
+currentDay <- as.Date("07/22/2020", format = "%m/%d/%y")
+dateVec = currentDay
+
+for (i in 1:N) {
+  newDf = dfCovidDailyCounty3[dfCovidDailyCounty3$date == currentDay, ]
+  newCases = newDf$cases[
+    match(as.numeric(dfCovidDailyCounty4$fip), newDf$fips)
+  ]
+  
+  dfCovidDailyCounty4 = data.frame(dfCovidDailyCounty4, newcases = newCases)
+  names(dfCovidDailyCounty4)[3 + i] = as.character(currentDay)
+  
+  day(currentDay) = day(currentDay) + 1
+  dateVec = c(dateVec, currentDay)
+}
+
+```
+
+```{r}
+matplot(
+  t(dfCovidDailyCounty4[, 4:(N + 1)]),
+  type='l', log='y',
+  xlab='days', ylab='covid counts - FL counties'
+)
+
+```
+
+```{r}
+###########SIR model for all counties#################
+noDays = N
+countyNoVec = 1:67
+countyNameVec = fl2010_cnty$name
+countyPopVec = fl2010_cnty$H010001
+observedDays = seq(1, noDays)
+futureDays = seq(noDays, 300)
+
+dfSIRResults.County = NA
+betaa = NA
+gammaa = NA
+
+for (countyNo in 1:length(countyNoVec)) {
+  print(countyNo)
+  CountyName = countyNameVec[countyNo]
+  Infected = as.numeric(
+    dfCovidDailyCounty4[
+      dfCovidDailyCounty4$county == CountyName, -c(1,2,3)
+    ]
+  )
+  
+  N = countyPopVec[countyNo]
+  res = fitSIR(Infected, N, observedDays, 300)
+  
+  print(res$SIRprm)
+  print(res$R0)
+  
+  betaa[countyNo] = res$SIRprm[1]
+  gammaa[countyNo] = res$SIRprm[2]
+  
+  newDF = rbind(
+    data.frame(Value=res$fit$S, type='S', County=CountyName, time=res$fit$time),
+    data.frame(Value=res$fit$I, type='I', County=CountyName, time=res$fit$time),
+    data.frame(Value=res$fit$R, type='R', County=CountyName, time=res$fit$time),
+    data.frame(Value=Infected, type='Data', County=CountyName, time=observedDays)
+  )
+  
+  dfSIRResults.County = rbind(dfSIRResults.County, newDF)
+}
+
+dfSIRResults.County = dfSIRResults.County[-1, ]
+
+sorted_dfSIRResults.County <- dfSIRResults.County[
+  order(dfSIRResults.County$County), ]
+
+sorted_dfCovidDailyCounty4 <- dfCovidDailyCounty4[
+  order(dfCovidDailyCounty4$county), ]
+
+dfSIRResults.County$type = as.factor(dfSIRResults.County$type)
+dfSIRResults.County$County = as.factor(dfSIRResults.County$County)
+
+```
+
+
+
+
