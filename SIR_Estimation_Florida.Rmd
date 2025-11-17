@@ -222,6 +222,19 @@ dfSIRResults.County$County = as.factor(dfSIRResults.County$County)
 
 ```
 
+```{r}
+# Save estimated beta and gamma values to the active script directory
+beta_gamma_df <- data.frame(
+  county = countyNameVec,
+  beta = betaa,
+  gamma = gammaa
+)
+
+beta_gamma_path <- file.path(script_dir, "beta_gamma_estimates.csv")
+write.csv(beta_gamma_df, beta_gamma_path, row.names = FALSE)
+cat("Beta/gamma estimates saved to:", beta_gamma_path, "\n")
+```
+
 
 
 
