@@ -27,7 +27,6 @@ Script Directory and data
 ```{r}
 
 script_dir <- this.dir()
-cat("Script directory:", script_dir, "\n")
 input_final_df <- file.path(script_dir, "final_df.csv")
 input_county_pop <- file.path(script_dir, "County.csv")
 
@@ -285,7 +284,6 @@ Save Output Files (USING script_dir)
 write.csv(regional_alpha, output_hierarchical, row.names = FALSE)
 write.csv(forecast_df_alpha, output_univariate, row.names = FALSE)
 
-cat("Files saved to:", script_dir, "\n")
 
 ```
 
